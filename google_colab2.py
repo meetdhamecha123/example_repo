@@ -9,23 +9,20 @@ from dataclasses import dataclass, field
 import logging
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 import time
 import csv
 import pandas as pd
+import logger
+
+load_dotenv()
+
 # Ollama Integration
 import ollama
-# Vector Database
+
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @dataclass
 class ColumnInfo:
@@ -50,7 +47,7 @@ class TableInfo:
     columns: List[ColumnInfo] = field(default_factory=list)
     relationships: List[Dict] = field(default_factory=list)
     indexes: List[str] = field(default_factory=list)
-
+    
 
 class EnhancedDatabaseAnalyzer:
     """Comprehensive database analyzer with deep schema understanding"""
@@ -632,7 +629,7 @@ class IntelligentQueryResolver:
                 'similar_queries': self._process_history_results(history_results),
                 'business_context': self._process_business_results(business_results)
             }
-        except Exception as e:      
+        except Exception as e:
             logger.error(f"Query resolution failed: {e}")
             return {
                 'schema_context': [],
@@ -687,6 +684,7 @@ class IntelligentQueryResolver:
             return []
 
         return [doc for doc in results['documents'][0]]
+
 class AdvancedTextToSQLEngine:
     """Production-grade Text-to-SQL engine with RAG and Ollama LLM"""
 
@@ -1481,112 +1479,3 @@ Response:"""
             print("=" * 80 + "\n")
         except Exception as e:
             logger.error(f"Could not display schema understanding: {e}")
-
-async def main():
-
-  # """Example usage and testing"""
-    connection_params = {
-        "host":"110.226.124.45",
-        "user":"MBooksUser",
-        "password":"MBooksUser$26042023",   # root password is blank in Colab
-        "database":"MBooks",
-        "port" : 3306
-    }
-
-    engine = AdvancedTextToSQLEngine(
-        connection_params=connection_params,
-        ollama_model= "qwen2.5-coder:7b",
-        ollama_host= "http://127.0.0.1:11434",
-        vector_db_path= "./vector_db",
-        output_dir="./query_outputs"
-    )
-
-    print("=" * 80)
-    print("🚀 Advanced Text-to-SQL Engine with RAG + Ollama LLM")
-    print("=" * 80)
-    print("\n⏳ Analyzing database and teaching LLM...")
-    print("💡 On subsequent runs, cached schema understanding will be loaded instantly!\n")
-
-    await engine.initialize(force_schema_refresh=False)
-
-    print("\n✅ Database analysis and LLM learning complete!")
-
-    engine.display_schema_understanding()
-
-    stats = engine.get_statistics()
-    print("\n📊 Engine Statistics:")
-    for key, value in stats.items():
-        formatted_key = key.replace('_', ' ').title()
-        print(f"   • {formatted_key}: {value}")
-
-    # Interactive mode
-    print("\n🎯 Interactive Mode")
-    print("💡 The LLM now fully understands your database schema!")
-    print("💡 Commands: 'schema' | 'stats' | 'exit' | ask any question")
-    print("-" * 80)
-
-    while True:
-        try:
-            user_query = input("\n💭 Your question: ").strip()
-
-            if not user_query:
-                continue
-
-            if user_query.lower() in ['exit', 'quit', 'q']:
-                print("\n👋 Goodbye!")
-                break
-
-            if user_query.lower() == 'schema':
-                engine.display_schema_understanding()
-                continue
-
-            if user_query.lower() == 'stats':
-                stats = engine.get_statistics()
-                print("\n📊 Current Statistics:")
-                for key, value in stats.items():
-                    formatted_key = key.replace('_', ' ').title()
-                    print(f"   • {formatted_key}: {value}")
-                continue
-
-            print("\n⏳ Processing...")
-            result = await engine.process_query(user_query, save_to_csv=True, save_to_json=False)
-
-            if result['success']:
-                cache_indicator = "♻️" if result.get('from_cache') else "🆕"
-                print(f"\n{cache_indicator} SQL: {result['sql']}")
-                print(f"📊 Found {result['row_count']} results in {result['execution_time']:.3f}s")
-
-                if result.get('csv_path'):
-                    print(f"💾 CSV saved to: {result['csv_path']}")
-                if result.get('json_path'):
-                    print(f"💾 JSON saved to: {result['json_path']}")
-
-                print("\n💬 Response:")
-                await engine.stream_natural_response_async(user_query, {
-                    'data': result['results'],
-                    'row_count': result['row_count'],
-                    'execution_time': result['execution_time']
-                })
-
-                MAX_PRINT_ROWS = 10
-                if result['row_count'] > 0 and result['row_count'] <= MAX_PRINT_ROWS:
-                    print(f"\n📋 Data:")
-                    for idx, row in enumerate(result['results'], 1):
-                        print(f"   {idx}. {row}")
-                elif result['row_count'] > MAX_PRINT_ROWS:
-                    print(f"\n📋 Sample Data (first {MAX_PRINT_ROWS} of {result['row_count']} rows):")
-                    for idx, row in enumerate(result['results'][:MAX_PRINT_ROWS], 1):
-                        print(f"   {idx}. {row}")
-                    print(f"   💡 See CSV file for complete results")
-            else:
-                print(f"\n❌ Error: {result.get('error')}")
-                print("💡 Try rephrasing your question or asking about table structure first.")
-
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
-            break
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            print(f"\n❌ Unexpected error: {e}")
-
-
