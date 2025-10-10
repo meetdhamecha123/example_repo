@@ -678,13 +678,145 @@ class IntelligentQueryResolver:
         return [doc for doc in results['documents'][0]]    
 
 class AdvancedTextToSQLEngine:
+    """Text-to-SQL engine using OpenRouter DeepSeek LLM"""
+    
+    def __init__(self, connection_params: dict,
+                 openrouter_api_key: str,
+                 vector_db_path: str = "./vector_db",
+                 output_dir: str = "./query_outputs"):
+        self.connection_params = connection_params
+        self.analyzer = EnhancedDatabaseAnalyzer(connection_params, vector_db_path)
+        self.resolver = IntelligentQueryResolver(self.analyzer)
+
+        self.openrouter_api_key = openrouter_api_key
+        self.openrouter_base = "https://openrouter.ai/api/v1"
+        self.openrouter_model = "moonshotai/kimi-dev-72b:free"
+        self.use_openrouter = False
+        self.openai_client = None
+        
+        if self.openrouter_api_key:
+            try:
+                self.openai_client = OpenAI(base_url=self.openrouter_base, api_key=self.openrouter_api_key)
+                self._verify_openrouter_setup()
+                self.use_openrouter = True
+                logger.info(f"✅ Engine initialized with OpenRouter model: {self.openrouter_model}")
+            except Exception as e:
+                logger.error(f"OpenRouter setup failed: {e}")
+                self.use_openrouter = False
+        
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # LLM schema understanding cache
+        self.llm_understanding_file = Path(vector_db_path) / "llm_schema_understanding.json"
+        self.schema_understood_by_llm = False
+        
+        # Query result cache
+        self.cache_dir = Path(vector_db_path) / "query_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_cache_files = 200
+
+        logger.info(f"✅ Engine initialized")
+    
+    def _verify_openrouter_setup(self):
+        """Verify OpenRouter connection and model."""
+        if not self.openai_client:
+            raise RuntimeError("OpenRouter client not initialized")
+        try:
+            resp = self.openai_client.chat.completions.create(
+                model=self.openrouter_model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=10
+            )
+            logger.info("✅ OpenRouter connection verified")
+        except Exception as e:
+            logger.error(f"OpenRouter verification failed: {e}")
+            raise
+
+    def _call_openrouter(self, messages: List[Dict], model: Optional[str] = None) -> str:
+        """Call OpenRouter and return ONLY the text content."""
+        if not self.openai_client:
+            raise RuntimeError("OpenRouter client not initialized")
+        
+        model = model or self.openrouter_model
+        
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=2000
+            )
+            
+            # CRITICAL FIX: Extract only the content string
+            content = response.choices[0].message.content
+            if content is None:
+                raise ValueError("OpenRouter returned empty content")
+            
+            return content.strip()
+            
+        except Exception as e:
+            logger.error(f"OpenRouter call failed: {e}")
+            raise
+
+    def _save_results_to_csv(self, results: List[Dict], query_id: str, query: str) -> str:
+        """Save query results to CSV file with proper error handling"""
+        try:
+            if not results:
+                logger.warning("No results to save to CSV")
+                return None
+
+            # Set CSV field size limit
+            import sys
+            max_size = sys.maxsize
+            try:
+                csv.field_size_limit(max_size)
+            except OverflowError:
+                csv.field_size_limit(int(1e9))
+
+            # Create safe filename
+            safe_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', query)[:50]
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{timestamp}_{safe_query}_{query_id[:8]}.csv"
+            filepath = self.output_dir / filename
+
+            # Convert to DataFrame for better CSV handling
+            df = pd.DataFrame(results)
+            df.to_csv(filepath, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+
+            logger.info(f"✅ Results saved to CSV: {filepath}")
+            return str(filepath)
+
+        except Exception as e:
+            logger.error(f"Failed to save CSV: {e}")
+            return None
+    
+    def _save_results_to_json(self, results: List[Dict], query_id: str, query: str) -> str:
+        """Save query results to JSON file"""
+        try:
+            if not results:
+                logger.warning("No results to save to JSON")
+                return None
+
+            # Create safe filename
+            safe_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', query)[:50]
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{timestamp}_{safe_query}_{query_id[:8]}.json"
+            filepath = self.output_dir / filename
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False, default=str)
+
+            logger.info(f"✅ Results saved to JSON: {filepath}")
+            return str(filepath)
+
+        except Exception as e:
+            logger.error(f"Failed to save JSON: {e}")
+            return None
+
     async def initialize(self, force_schema_refresh: bool = False):
         """Initialize engine: analyze database and teach LLM schema."""
-        # Analyze the database schema
         await self.analyzer.analyze_complete_database(force_refresh=force_schema_refresh)
-        # Teach the LLM about the schema
         await self._teach_llm_schema()
-        # Mark schema as understood
         self.schema_understood_by_llm = True
         
     async def stream_natural_response_async(self, query: str, result: Dict[str, Any]):
@@ -715,158 +847,25 @@ Generate a clear, concise response that:
 Response:"""
 
         try:
-            # Use the correct OpenAI client streaming method
             stream = self.openai_client.chat.completions.create(
                 model=self.openrouter_model,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant that explains data clearly."},
                     {"role": "user", "content": prompt}
                 ],
-                stream=True
+                stream=True,
+                max_tokens=1000
             )
             for chunk in stream:
                 if hasattr(chunk, 'choices') and chunk.choices:
                     content = getattr(chunk.choices[0].delta, 'content', None)
                     if content:
                         print(content, end='', flush=True)
-            print()  # New line after streaming
+            print()
         except Exception as e:
             logger.warning(f"Streaming failed: {e}, using fallback")
-            # Fallback: just print a static message
-            print("[Streaming unavailable, please check logs or use non-streaming mode]")
+            print("[Streaming unavailable, please check logs]")
         
-    """Text-to-SQL engine using OpenRouter DeepSeek LLM (no Ollama)"""
-    def __init__(self, connection_params: dict,
-                 openrouter_api_key: str,
-                 vector_db_path: str = "./vector_db",
-                 output_dir: str = "./query_outputs"):
-        self.connection_params = connection_params
-        self.analyzer = EnhancedDatabaseAnalyzer(connection_params, vector_db_path)
-        self.resolver = IntelligentQueryResolver(self.analyzer)
-
-        self.openrouter_api_key = openrouter_api_key
-        self.openrouter_base = "https://openrouter.ai/api/v1"
-        self.openrouter_model = "deepseek/deepseek-chat-v3.1:free"
-        self.use_openrouter = False
-        self.openai_client = None
-        
-        if self.openrouter_api_key:
-            try:
-                self.openai_client = OpenAI(base_url=self.openrouter_base, api_key=self.openrouter_api_key)
-                try:
-                    self._verify_openrouter_setup()
-                    self.use_openrouter = True
-                    logger.info(f"✅ Engine initialized with OpenRouter model: {self.openrouter_model}")
-                    
-                except Exception as e:
-                    logger.error(f"OpenRouter setup verification failed: {e}")
-                    self.use_openrouter = False
-            except Exception as e:
-                logger.error(f"Failed to initialize OpenRouter client: {e}")
-                self.use_openrouter = False
-        
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # LLM schema understanding cache
-        self.llm_understanding_file = Path(vector_db_path) / "llm_schema_understanding.json"
-        self.schema_understood_by_llm = False
-        
-         # Query result cache
-        self.cache_dir = Path(vector_db_path) / "query_cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.max_cache_files = 200
-
-        logger.info(f"✅ Engine initialized with OpenRouter DeepSeek model: {self.openrouter_model}")
-    
-    def _verify_openrouter_setup(self):
-        """Verify OpenRouter (OpenAI-compatible) connection and model."""
-        if not self.openai_client:
-            raise RuntimeError("OpenRouter client not initialized")
-        try:
-            resp = self.openai_client.chat.completions.create(
-                model=self.openrouter_model,
-                messages=[{"role": "user", "content": "ping"}],
-                extra_headers={"HTTP-Referer": os.getenv("OPENROUTER_REFERER", "")},
-                extra_body={}
-            )
-            logger.info("✅ OpenRouter probe succeeded")
-        except Exception as e:
-            logger.error(f"OpenRouter probe failed: {e}")
-            raise
-
-    def _call_openrouter(self, messages: List[Dict], model: Optional[str] = None, extra_headers: Dict = None, extra_body: Dict = None) -> str:
-        """Call OpenRouter synchronously and return content string."""
-        if not self.openai_client:
-            raise RuntimeError("OpenRouter client not initialized")
-        model = model or self.openrouter_model
-        payload = {}
-        if extra_body:
-            payload.update(extra_body)
-        try:
-            response = self.openai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **payload
-            )
-            try:
-                return response.choices[0].message.content.strip()
-            except Exception:
-                return str(response)
-        except Exception as e:
-            logger.error(f"OpenRouter call failed: {e}")
-            raise
-
-    def _save_results_to_csv(self, results: List[Dict], query_id: str, query: str) -> str:
-        """Save query results to CSV file with proper error handling and large field support"""
-        try:
-            if not results:
-                logger.warning("No results to save to CSV")
-                return None
-
-            import sys
-            max_size = sys.maxsize
-            try:
-                csv.field_size_limit(max_size)
-            except OverflowError:
-                csv.field_size_limit(int(1e9))
-
-            # Create safe filename from query
-            safe_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', query)[:50]
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{timestamp}_{safe_query}_{query_id[:8]}.csv"
-            filepath = self.output_dir / filename
-
-            # Convert to DataFrame for better CSV handling
-            df = pd.DataFrame(results)
-
-            # Save with proper encoding and error handling
-            df.to_csv(filepath, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
-
-            logger.info(f"✅ Results saved to CSV: {filepath}")
-            return str(filepath)
-
-        except Exception as e:
-            logger.error(f"Failed to save CSV: {e}")
-            # Fallback: Try manual CSV writing
-            try:
-                import sys
-                max_size = sys.maxsize
-                try:
-                    csv.field_size_limit(max_size)
-                except OverflowError:
-                    csv.field_size_limit(int(1e9))
-                with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
-                    if results:
-                        writer = csv.DictWriter(f, fieldnames=results[0].keys(), quoting=csv.QUOTE_ALL)
-                        writer.writeheader()
-                        writer.writerows(results)
-                logger.info(f"✅ Results saved to CSV (fallback method): {filepath}")
-                return str(filepath)
-            except Exception as e2:
-                logger.error(f"CSV fallback also failed: {e2}")
-                return None
-    
     async def _teach_llm_schema(self):
         """Teach the LLM about the complete database schema"""
         try:
@@ -883,27 +882,16 @@ Your task is to understand:
 4. Sample data patterns
 5. Business logic implied by table and column names
 
-Please provide a comprehensive summary of your understanding of this database, including:
-- Main entities and their relationships
-- Key business concepts represented
-- Important patterns for common queries
-- Any insights about the data model
+Please provide a comprehensive summary of your understanding of this database.
 
 Summary:"""
 
-            response = self.openai_client.chat(
-                model=self.openrouter_model,
-                messages=[
-                    {"role": "system", "content": "You are a database expert who analyzes and understands database schemas deeply."},
-                    {"role": "user", "content": learning_prompt}
-                ],
-                options={
-                    "temperature": 0.3,
-                    "num_predict": 2000
-                }
-            )
+            messages = [
+                {"role": "system", "content": "You are a database expert who analyzes schemas."},
+                {"role": "user", "content": learning_prompt}
+            ]
             
-            llm_understanding = response['message']['content'].strip()
+            llm_understanding = await asyncio.to_thread(self._call_openrouter, messages)
             
             understanding_id = f"llm_understanding_{self.connection_params['database']}"
             self.analyzer.llm_schema_collection.upsert(
@@ -928,38 +916,41 @@ Summary:"""
             with open(self.llm_understanding_file, 'w', encoding='utf-8') as f:
                 json.dump(understanding_data, f, indent=2, ensure_ascii=False)
             
-            logger.info("✅ LLM has learned and understood the complete database schema")
-            logger.info(f"📝 Understanding summary:\n{llm_understanding[:500]}...")
+            logger.info("✅ LLM has learned the database schema")
             
         except Exception as e:
             logger.error(f"Failed to teach LLM schema: {e}")
-            
+
     async def process_query(self, natural_query: str) -> Dict[str, Any]:
-        """Process natural language query end-to-end (OpenRouter only)"""
+        """Process natural language query end-to-end"""
         start_time = datetime.now()
         query_id = hashlib.md5(natural_query.encode()).hexdigest()
+        
         try:
+            # Get context from RAG
             context = await self.resolver.resolve_query(natural_query)
+            
+            # Generate SQL
             sql = await self._generate_sql_with_context(natural_query, context)
+            
+            # Execute SQL
             result = await self._execute_sql(sql)
+            
+            execution_time = (datetime.now() - start_time).total_seconds()
+            
+            # Save results to files
+            csv_path = None
+            json_path = None
+            
+            if result['row_count'] > 0:
+                csv_path = self._save_results_to_csv(result['data'], query_id, natural_query)
+                json_path = self._save_results_to_json(result['data'], query_id, natural_query)
+            
+            # Generate natural language response
             nl_response = await self._generate_natural_response(natural_query, result)
-            return {
-                'success': True,
-                'natural_query': natural_query,
-                'sql': sql,
-                'results': result['data'],
-                'row_count': result['row_count'],
-                'natural_response': nl_response,
-                'execution_time': (datetime.now() - start_time).total_seconds(),
-                'from_cache': False
-            }
-        except Exception as e:
-            logger.error(f"Query processing failed: {e}")
-            return {
-                'success': False,
-                'natural_query': natural_query,
-                'error': str(e)
-            }
+            
+            # Cache the query
+            await self._cache_query(natural_query, sql, result, nl_response, csv_path, json_path)
             
             return {
                 'success': True,
@@ -982,64 +973,8 @@ Summary:"""
                 'error': str(e)
             }
 
-    def _is_meta_query(self, query: str) -> bool:
-        """Check if query is about database structure itself"""
-        meta_patterns = [
-            r'how many tables',
-            r'list (?:all )?tables',
-            r'show (?:all )?tables',
-            r'what tables',
-            r'database structure',
-            r'schema',
-            r'table names',
-            r'describe (?:all )?tables?',
-            r'list columns'
-        ]
-        
-        query_lower = query.lower()
-        return any(re.search(pattern, query_lower) for pattern in meta_patterns)
-
-    async def _handle_meta_query(self, query: str) -> Dict[str, Any]:
-        """Handle queries about database structure"""
-        query_lower = query.lower()
-        
-        if 'how many tables' in query_lower:
-            count = len(self.analyzer._schema_cache)
-            table_names = list(self.analyzer._schema_cache.keys())
-            
-            return {
-                'success': True,
-                'natural_query': query,
-                'sql': 'SHOW TABLES',
-                'results': [{'table': name} for name in table_names],
-                'row_count': count,
-                'natural_response': f"Your database contains {count} tables: {', '.join(table_names)}",
-                'execution_time': 0.001,
-                'from_cache': False
-            }
-        
-        elif any(kw in query_lower for kw in ['list tables', 'show tables', 'what tables']):
-            summary = self.analyzer.get_schema_summary()
-            
-            response = f"Your database '{summary['database']}' has {summary['total_tables']} tables:\n\n"
-            for table in summary['tables']:
-                response += f"• {table['name']}: {table['rows']} rows, {table['columns']} columns\n"
-            
-            return {
-                'success': True,
-                'natural_query': query,
-                'sql': 'SHOW TABLES',
-                'results': summary['tables'],
-                'row_count': summary['total_tables'],
-                'natural_response': response,
-                'execution_time': 0.001,
-                'from_cache': False
-            }
-        
-        return await self.process_query(query)
-    
     async def _generate_sql_with_context(self, query: str, context: Dict) -> str:
-        """Generate SQL using Ollama with RAG context and schema understanding"""
+        """Generate SQL using OpenRouter with RAG context"""
         
         schema_context = "\n".join([
             f"- {item['content']}"
@@ -1057,27 +992,13 @@ Summary:"""
             for sq in context['similar_queries'][:2]:
                 similar_examples += f"Query: {sq['query']}\nSQL: {sq['sql']}\n\n"
         
-        llm_context = ""
-        if self.schema_understood_by_llm:
-            try:
-                understanding_results = self.analyzer.llm_schema_collection.query(
-                    query_texts=[query],
-                    n_results=1
-                )
-                if understanding_results['documents'] and understanding_results['documents'][0]:
-                    llm_context = f"\n\nYOUR SCHEMA UNDERSTANDING:\n{understanding_results['documents'][0][0]}\n"
-            except:
-                pass
-        
-        prompt = f"""You are an expert SQL generator for MySQL databases. You have thoroughly studied this database schema.
+        prompt = f"""You are an expert SQL generator for MySQL databases.
 
 RELEVANT SCHEMA CONTEXT:
 {schema_context}
 
 BUSINESS LOGIC:
 {business_context}
-
-{llm_context}
 
 {similar_examples}
 
@@ -1091,52 +1012,36 @@ RULES:
 3. Use JOINs when referencing multiple tables
 4. Add appropriate WHERE, GROUP BY, ORDER BY, and LIMIT clauses
 5. For safety, always add LIMIT clause (max 1000)
-6. Return ONLY the SQL query, no explanations
+6. Return ONLY the SQL query, no explanations or markdown
 
 SQL:"""
         
-        attempts = 3
-        backoff = 0.5
-        last_exc = None
+        messages = [
+            {"role": "system", "content": "You are a SQL expert. Generate only valid MySQL queries."},
+            {"role": "user", "content": prompt}
+        ]
         
-        for attempt in range(attempts):
-            try:
-                if self.use_openrouter:
-                    messages = [
-                        {"role": "system", "content": "You are a SQL expert. Generate only valid MySQL queries."},
-                        {"role": "user", "content": prompt}
-                    ]
-                    sql = await asyncio.to_thread(self._call_openrouter, messages, self.openrouter_model)
-                else:
-                    response = self.openai_client.chat(
-                        model=self.openrouter_model,
-                        messages=[
-                            {"role": "system", "content": "You are a SQL expert. Generate only valid MySQL queries."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        options={
-                            "temperature": 0.1,
-                            "num_predict": 500
-                        }
-                    )
-
-                    sql = response['message']['content'].strip()
-                sql = self._clean_sql(sql)
-                sql = self._validate_sql(sql)
-                return sql
-            except Exception as e:
-                last_exc = e
-                logger.warning(f"LLM generation attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(backoff * (attempt + 1))
-
-        logger.error(f"LLM SQL generation failed after {attempts} attempts: {last_exc}")
-        raise last_exc
+        sql = await asyncio.to_thread(self._call_openrouter, messages)
+        
+        # Clean the SQL
+        sql = self._clean_sql(sql)
+        sql = self._validate_sql(sql)
+        
+        return sql
     
     def _clean_sql(self, sql: str) -> str:
         """Clean and format SQL"""
+        # Remove markdown code blocks
         sql = sql.replace('```sql', '').replace('```', '').strip()
-        sql = sql.replace('<｜begin▁of▁sentence｜>', '').replace('<|begin_of_sentence|>', '').strip()
-        sql = sql.rstrip(';')
+        
+        # Remove special tokens
+        sql = sql.replace('<｜begin▁of▁sentence｜>', '')
+        sql = sql.replace('<|begin_of_sentence|>', '')
+        sql = sql.replace('</s>', '')
+        
+        # Remove trailing semicolon
+        sql = sql.rstrip(';').strip()
+        
         return sql
     
     def _validate_sql(self, sql: str) -> str:
@@ -1144,6 +1049,7 @@ SQL:"""
         if not sql:
             raise ValueError("Empty SQL query generated")
         
+        # Check for dangerous operations
         dangerous_patterns = [
             r'\b(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE|GRANT|REVOKE)\b'
         ]
@@ -1152,7 +1058,7 @@ SQL:"""
             if re.search(pattern, sql, re.IGNORECASE):
                 raise ValueError(f"Dangerous SQL operation detected")
         
-        
+        # Add LIMIT if not present
         if 'LIMIT' not in sql.upper():
             sql += ' LIMIT 100'
         
@@ -1192,7 +1098,7 @@ SQL:"""
         if result['row_count'] == 0:
             return "No results found for your query."
         
-        data_summary = json.dumps(result['data'][:3], indent=2, default=str)
+        data_summary = json.dumps(result['data'][:5], indent=2, default=str)
         
         prompt = f"""Convert this SQL query result into a natural, conversational response.
 
@@ -1206,249 +1112,22 @@ Generate a clear, concise response that:
 2. Mentions key findings from the data
 3. Uses natural language (no technical jargon)
 4. Is friendly and professional
-
-IMPORTANT: Return the full answer. Do not end with phrases like '... and N more'. If the result set is large, summarize key insights.
+5. Return the full answer (do not end with '... and N more')
 
 Response:"""
 
-        attempts = 3
-        backoff = 0.5
-        last_exc = None
-        
-        for attempt in range(attempts):
-            try:
-                if self.use_openrouter:
-                    messages = [
-                        {"role": "system", "content": "You are a helpful assistant that explains data clearly."},
-                        {"role": "user", "content": prompt}
-                    ]
-                    text = await asyncio.to_thread(self._call_openrouter, messages, self.openrouter_model)
-                else:
-                    response = self.openai_client.chat(
-                        model=self.openrouter_model,
-                        messages=[
-                            {"role": "system", "content": "You are a helpful assistant that explains data clearly."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        options={
-                            "temperature": 0.7,
-                            "num_predict": 600
-                        }
-                    )
-
-                    text = response['message']['content'].strip()
-                text = re.sub(r"\*\*?\d+ more\*\*?", "", text)
-                text = re.sub(r"and \d+ more", "", text)
-
-                return text
-            except Exception as e:
-                last_exc = e
-                logger.warning(f"Natural response attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(backoff * (attempt + 1))
-
-        logger.warning(f"Natural response generation failed: {last_exc}")
-        return f"Found {result['row_count']} results."
-    
-    async def _cache_query(self, query: str, sql: str, result: Dict, natural_response: str = None, 
-                          csv_path: str = None, json_path: str = None):
-        """Cache successful query for future use"""
-        try:
-            query_id = hashlib.md5(query.encode()).hexdigest()
-            cached = dict(result)
-            
-            if natural_response is not None:
-                cached['natural_response'] = natural_response
-            if csv_path:
-                cached['csv_path'] = csv_path
-            if json_path:
-                cached['json_path'] = json_path
-
-            result_path = str(self.cache_dir / f"{query_id}.json")
-            with open(result_path, 'w', encoding='utf-8') as wf:
-                json.dump(cached, wf, default=str, ensure_ascii=False, indent=2)
-
-            metadata = {
-                'sql': sql,
-                'timestamp': str(datetime.now()),
-                'row_count': str(result['row_count']),
-                'execution_time': str(result['execution_time']),
-                'result_path': result_path,
-                'nl_cached': bool(natural_response is not None)
-            }
-
-            self.analyzer.query_collection.upsert(
-                documents=[query],
-                metadatas=[metadata],
-                ids=[query_id]
-            )
-
-            # Evict old cache files
-            cache_files = sorted(self.cache_dir.glob('*.json'), key=lambda p: p.stat().st_mtime)
-            if len(cache_files) > self.max_cache_files:
-                to_remove = cache_files[: len(cache_files) - self.max_cache_files]
-                for p in to_remove:
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.warning(f"Query caching failed: {e}")
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get engine statistics"""
-        try:
-            return {
-                'cached_queries': self.analyzer.query_collection.count(),
-                'schema_embeddings': self.analyzer.schema_collection.count(),
-                'business_patterns': self.analyzer.business_collection.count(),
-                'tables_analyzed': len(self.analyzer._schema_cache),
-                'llm_understood': self.schema_understood_by_llm,
-                'llm_understanding_stored': self.analyzer.llm_schema_collection.count() > 0,
-                'openrouter_model': self.openrouter_model,
-                'output_directory': str(self.output_dir)
-            }
-        except Exception as e:
-            logger.error(f"Failed to get statistics: {e}")
-            return {}
-    
-    def display_schema_understanding(self):
-        """Display LLM's understanding of the schema"""
-        if not self.llm_understanding_file.exists():
-            print("❌ LLM has not yet learned the schema")
-            return
-        try:
-            with open(self.llm_understanding_file, 'r', encoding='utf-8') as f:
-                understanding = json.load(f)
-
-            print("\n" + "=" * 80)
-            print("🧠 LLM SCHEMA UNDERSTANDING")
-            print("=" * 80)
-            print(f"Database: {understanding.get('database')}")
-            print(f"Tables Analyzed: {understanding.get('tables_count')}")
-            print(f"Last Updated: {understanding.get('last_understood')}")
-            print("\n" + "-" * 80)
-            print("Summary:")
-            print("-" * 80)
-            print(understanding.get('llm_summary', 'No summary available'))
-            print("=" * 80 + "\n")
-        except Exception as e:
-            logger.error(f"Could not display schema understanding: {e}")
-
-    
-    async def process_query(self, natural_query: str) -> Dict[str, Any]:
-        context = await self.resolver.resolve_query(natural_query)
-        sql = await self._generate_sql_with_context(natural_query, context)
-        result = await self._execute_sql(sql)
-        nl_response = await self._generate_natural_response(natural_query, result)
-        return {
-            'success': True,
-            'natural_query': natural_query,
-            'sql': sql,
-            'results': result['data'],
-            'row_count': result['row_count'],
-            'natural_response': nl_response
-        }
-
-    async def _generate_sql_with_context(self, query: str, context: Dict) -> str:
-        schema_context = "\n".join([
-            f"- {item['content']}"
-            for item in context['schema_context'][:5]
-        ])
-        business_context = "\n".join([
-            f"- {item}"
-            for item in context['business_context'][:3]
-        ])
-        similar_examples = ""
-        if context['similar_queries']:
-            similar_examples = "\nSimilar queries:\n"
-            for sq in context['similar_queries'][:2]:
-                similar_examples += f"Query: {sq['query']}\nSQL: {sq['sql']}\n\n"
-        prompt = f"""You are an expert SQL generator for MySQL databases.\n\nRELEVANT SCHEMA CONTEXT:\n{schema_context}\n\nBUSINESS LOGIC:\n{business_context}\n\n{similar_examples}\nUSER QUERY: {query}\n\nGenerate a valid MySQL SELECT query that answers the user's question.\nRULES:\n1. Only generate SELECT statements (no INSERT, UPDATE, DELETE, DROP)\n2. Use proper table and column names from the context\n3. Use JOINs when referencing multiple tables\n4. Add appropriate WHERE, GROUP BY, ORDER BY, and LIMIT clauses\n5. For safety, always add LIMIT clause (max 1000)\n6. Return ONLY the SQL query, no explanations\nSQL:"""
         messages = [
-            {"role": "system", "content": "You are a SQL expert. Generate only valid MySQL queries."},
+            {"role": "system", "content": "You are a helpful assistant that explains data clearly."},
             {"role": "user", "content": prompt}
         ]
-        sql = await asyncio.to_thread(self._call_openrouter, messages, self.openrouter_model)
-        # Clean up unwanted tokens from LLM output
-        sql = sql.replace('```sql', '').replace('```', '').replace('<｜begin▁of▁sentence｜>', '').replace('<|begin_of_sentence|>', '').strip().rstrip(';')
-        if 'LIMIT' not in sql.upper():
-            sql += ' LIMIT 100'
-        return sql
-
-    async def _execute_sql(self, sql: str) -> Dict[str, Any]:
-        conn = self.analyzer.get_connection()
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        cursor.execute(sql)
-        results = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return {
-            'data': results,
-            'row_count': len(results)
-        }
-
-    async def _generate_natural_response(self, query: str, result: Dict) -> str:
-        """Generate natural language response from SQL results"""
         
-        if result['row_count'] == 0:
-            return "No results found for your query."
+        text = await asyncio.to_thread(self._call_openrouter, messages)
         
-        data_summary = json.dumps(result['data'][:3], indent=2, default=str)
+        # Remove incomplete phrases
+        text = re.sub(r"\*\*?\d+ more\*\*?", "", text)
+        text = re.sub(r"and \d+ more", "", text)
         
-        prompt = f"""Convert this SQL query result into a natural, conversational response.
-
-Original question: {query}
-Number of results: {result['row_count']}
-Sample data:
-{data_summary}
-
-Generate a clear, concise response that:
-1. Answers the question directly
-2. Mentions key findings from the data
-3. Uses natural language (no technical jargon)
-4. Is friendly and professional
-
-IMPORTANT: Return the full answer. Do not end with phrases like '... and N more'. If the result set is large, summarize key insights.
-
-Response:"""
-
-        attempts = 3
-        backoff = 0.5
-        last_exc = None
-        
-        for attempt in range(attempts):
-            try:
-                if self.use_openrouter:
-                    messages = [
-                        {"role": "system", "content": "You are a helpful assistant that explains data clearly."},
-                        {"role": "user", "content": prompt}
-                    ]
-                    text = await asyncio.to_thread(self._call_openrouter, messages, self.openrouter_model)
-                else:
-                    response = self.openai_client.chat(
-                        model=self.openrouter_model,
-                        messages=[
-                            {"role": "system", "content": "You are a helpful assistant that explains data clearly."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        options={
-                            "temperature": 0.7,
-                            "num_predict": 600
-                        }
-                    )
-
-                    text = response['message']['content'].strip()
-                text = re.sub(r"\*\*?\d+ more\*\*?", "", text)
-                text = re.sub(r"and \d+ more", "", text)
-
-                return text
-            except Exception as e:
-                last_exc = e
-                logger.warning(f"Natural response attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(backoff * (attempt + 1))
-
-        logger.warning(f"Natural response generation failed: {last_exc}")
-        return f"Found {result['row_count']} results."
+        return text
     
     async def _cache_query(self, query: str, sql: str, result: Dict, natural_response: str = None, 
                           csv_path: str = None, json_path: str = None):
@@ -1472,7 +1151,7 @@ Response:"""
                 'sql': sql,
                 'timestamp': str(datetime.now()),
                 'row_count': str(result['row_count']),
-                'execution_time': str(result['execution_time']),
+                'execution_time': str(result.get('execution_time', 0)),
                 'result_path': result_path,
                 'nl_cached': bool(natural_response is not None)
             }
@@ -1494,7 +1173,7 @@ Response:"""
                         pass
         except Exception as e:
             logger.warning(f"Query caching failed: {e}")
-            
+    
     def get_statistics(self) -> Dict[str, Any]:
         """Get engine statistics"""
         try:
@@ -1504,7 +1183,6 @@ Response:"""
                 'business_patterns': self.analyzer.business_collection.count(),
                 'tables_analyzed': len(self.analyzer._schema_cache),
                 'llm_understood': self.schema_understood_by_llm,
-                'llm_understanding_stored': self.analyzer.llm_schema_collection.count() > 0,
                 'openrouter_model': self.openrouter_model,
                 'output_directory': str(self.output_dir)
             }
@@ -1517,6 +1195,7 @@ Response:"""
         if not self.llm_understanding_file.exists():
             print("❌ LLM has not yet learned the schema")
             return
+        
         try:
             with open(self.llm_understanding_file, 'r', encoding='utf-8') as f:
                 understanding = json.load(f)
@@ -1544,22 +1223,22 @@ async def main():
         "user": os.getenv("DB_USER"),
         "password": os.getenv("DB_PASSWORD"),
         "database": os.getenv("DB_NAME"),
-        "port": int(os.getenv("DB_PORT"))
+        "port": int(os.getenv("DB_PORT", "3306"))
     }
     
-    # Initialize engine with Ollama
+    # Initialize engine
     engine = AdvancedTextToSQLEngine(
         connection_params=connection_params,
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
-        vector_db_path=os.getenv("VECTOR_DB_PATH"),
-        output_dir=os.getenv("OUTPUT_DIR")
+        vector_db_path=os.getenv("VECTOR_DB_PATH", "./vector_db"),
+        output_dir=os.getenv("OUTPUT_DIR", "./query_outputs")
     )
     
     print("=" * 80)
-    print("🚀 Advanced Text-to-SQL Engine with RAG + Ollama LLM")
+    print("🚀 Advanced Text-to-SQL Engine with RAG + OpenRouter")
     print("=" * 80)
     print("\n⏳ Analyzing database and teaching LLM...")
-    print("💡 On subsequent runs, cached schema understanding will be loaded instantly!\n")
+    print("💡 On subsequent runs, cached schema will be loaded instantly!\n")
     
     await engine.initialize(force_schema_refresh=False)
     
@@ -1632,7 +1311,7 @@ async def main():
                     print(f"\n📋 Sample Data (first {MAX_PRINT_ROWS} of {result['row_count']} rows):")
                     for idx, row in enumerate(result['results'][:MAX_PRINT_ROWS], 1):
                         print(f"   {idx}. {row}")
-                    print(f"   💡 See CSV file for complete results")
+                    print(f"   💡 See CSV/JSON files for complete results")
             else:
                 print(f"\n❌ Error: {result.get('error')}")
                 print("💡 Try rephrasing your question or asking about table structure first.")
